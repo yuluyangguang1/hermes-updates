@@ -1,0 +1,88 @@
+name: Sync Hermes release feeds
+
+# Pulls GitHub releases from the two upstream repos and commits
+# the JSON snapshots to data/*.json. yuai-site mirrors these files
+# every 30 minutes so the changelog page stays fast and never
+# burns the visitor's anonymous GitHub API quota.
+#
+# Sources:
+#   - portable: yuluyangguang1/hermes-portable
+#   - standard: NousResearch/hermes-agent
+#
+# Triggers:
+#   - Every 30 minutes via cron
+#   - Manual workflow_dispatch
+#   - On push to main (workflow file changes only)
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/sync.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: hermes-updates-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Fetch release feeds
+        env:
+          # Authenticated requests get 5000/h instead of 60/h. The
+          # default GITHUB_TOKEN is enough since we only read public
+          # repos.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p data
+
+          fetch_releases() {
+            local repo="$1"
+            local out="$2"
+            # Up to 50 most recent releases per repo. GitHub returns
+            # them newest-first which matches the renderer's
+            # expectation. We pipe through jq to drop the giant
+            # `assets` array; only `tag_name`, `name`, `body`,
+            # `published_at`, `html_url`, `prerelease`, `draft` are
+            # consumed by the page.
+            curl -fsSL --retry 3 \
+              -H "Accept: application/vnd.github.v3+json" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              "https://api.github.com/repos/${repo}/releases?per_page=50" \
+              | jq '[.[] | {tag_name, name, body, published_at, created_at, html_url, prerelease, draft}]' \
+              > "${out}.new"
+            mv "${out}.new" "$out"
+            echo "  [$repo] -> $out  ($(wc -c < "$out") bytes, $(jq length "$out") releases)"
+          }
+
+          # Failures are caught individually so a transient hiccup on
+          # one repo doesn't lose the other one's snapshot.
+          fetch_releases "yuluyangguang1/hermes-portable" "data/portable.json" || echo "WARN: portable fetch failed"
+          fetch_releases "NousResearch/hermes-agent"      "data/standard.json" || echo "WARN: standard fetch failed"
+
+      - name: Commit if changed
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/
+          if git diff --cached --quiet; then
+            echo "No changes."
+            exit 0
+          fi
+          git commit -m "sync: refresh release feeds
+
+          - hermes-portable releases
+          - NousResearch/hermes-agent releases"
+          git push
