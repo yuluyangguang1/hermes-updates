@@ -1,0 +1,63 @@
+name: Sync Hermes release feeds
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/sync.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: hermes-updates-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Fetch release feeds
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p data
+
+          fetch_releases() {
+            local repo="$1"
+            local out="$2"
+            curl -fsSL --retry 3 \
+              -H "Accept: application/vnd.github.v3+json" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              "https://api.github.com/repos/${repo}/releases?per_page=50" \
+              | jq '[.[] | {tag_name, name, body, published_at, created_at, html_url, prerelease, draft}]' \
+              > "${out}.new"
+            mv "${out}.new" "$out"
+            echo "  [$repo] -> $out  ($(wc -c < "$out") bytes, $(jq length "$out") releases)"
+          }
+
+          fetch_releases "yuluyangguang1/hermes-portable" "data/portable.json" || echo "WARN: portable fetch failed"
+          fetch_releases "NousResearch/hermes-agent"      "data/standard.json" || echo "WARN: standard fetch failed"
+
+      - name: Commit if changed
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/
+          if git diff --cached --quiet; then
+            echo "No changes."
+            exit 0
+          fi
+          git commit -m "sync: refresh release feeds
+
+          - hermes-portable releases
+          - NousResearch/hermes-agent releases"
+          git push
